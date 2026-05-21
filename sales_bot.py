@@ -9,18 +9,20 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─── КОНФИГУРАЦИЯ ───────────────────────────────────────────────────────────
-# Значения берутся из переменных окружения (Railway) или из defaults ниже
 
 BITRIX_WEBHOOK   = os.getenv("BITRIX_WEBHOOK",   "https://bitrix.uzum.com/rest/297435/2jygolso75y7ozjb/")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8319953238:AAHsGW0vZYYAgQpPdk3DsE6b_Rerzg8Z-UI")
 _chat_ids_env    = os.getenv("ALLOWED_CHAT_IDS",  "-1002830183416")
 ALLOWED_CHAT_IDS : List[int] = [int(x.strip()) for x in _chat_ids_env.split(",") if x.strip()]
+
+TZ = ZoneInfo("Asia/Tashkent")
 
 EMPLOYEES: Dict[int, str] = {
     389012: "Akmaljon Xolmatov",
@@ -31,11 +33,7 @@ EMPLOYEES: Dict[int, str] = {
 PIPELINE_SALES_ID = 64
 PIPELINE_DEV_ID   = 58
 
-# ─── ID ЭТАПОВ ───────────────────────────────────────────────────────────────
-# Воронка Продажи (cat 64)
-STAGE_SALES_DELETION = "C64:UC_PIVQTV"   # На удаление
-
-# Воронка Развитие (cat 58)
+STAGE_SALES_DELETION = "C64:UC_PIVQTV"
 STAGE_DEV_NACHALO    = "C58:NEW"
 STAGE_DEV_SBOR       = "C58:PREPARATION"
 STAGE_DEV_TEH_VAL    = "C58:PREPAYMENT_INVOIC"
@@ -43,7 +41,6 @@ STAGE_DEV_DORABOTKI  = "C58:UC_LGK1JM"
 STAGE_DEV_FINAL      = "C58:FINAL_INVOICE"
 STAGE_DEV_TEST_ORDER = "C58:UC_PRSTUZ"
 
-# Причины удаления (ищутся в комментариях)
 DELETION_REASONS: Dict[str, List[str]] = {
     "НДЗ":        ["ндз", "не дозвон", "недозвон"],
     "Спам":       ["спам", "spam"],
@@ -52,7 +49,6 @@ DELETION_REASONS: Dict[str, List[str]] = {
     "Отказ":      ["отказ"],
 }
 
-# "Договорились" — ищем эти слова в комментариях к сделке
 AGREED_KEYWORDS = ["договорились", "жду реквизит", "реквизиты", "ждем реквизит"]
 
 # ─── ЛОГИРОВАНИЕ ─────────────────────────────────────────────────────────────
@@ -83,7 +79,6 @@ async def bx_call(session: aiohttp.ClientSession, method: str, params: dict = No
 
 
 async def bx_list_all(session: aiohttp.ClientSession, method: str, params: dict = None) -> List[dict]:
-    """Все записи с пагинацией"""
     results, start, params = [], 0, (params or {})
     while True:
         data = await bx_post(session, method, {**params, "start": start})
@@ -112,13 +107,12 @@ async def bx_batch(session: aiohttp.ClientSession, commands: Dict[str, str]) -> 
 # ─── ПОЛУЧЕНИЕ СДЕЛОК ────────────────────────────────────────────────────────
 
 async def get_modified_deals(
-    session:     aiohttp.ClientSession,
-    date_from:   datetime,
-    date_to:     datetime,
+    session: aiohttp.ClientSession,
+    date_from: datetime,
+    date_to: datetime,
     category_id: int,
     extra_filter: dict = None,
 ) -> List[dict]:
-    """Сделки категории, изменённые за период"""
     f = {
         "CATEGORY_ID": str(category_id),
         ">=DATE_MODIFY": date_from.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -133,12 +127,11 @@ async def get_modified_deals(
 
 
 async def get_created_deals(
-    session:     aiohttp.ClientSession,
-    date_from:   datetime,
-    date_to:     datetime,
+    session: aiohttp.ClientSession,
+    date_from: datetime,
+    date_to: datetime,
     category_id: int,
 ) -> List[dict]:
-    """Сделки категории, СОЗДАННЫЕ за период (переводы из другой воронки)"""
     return await bx_list_all(session, "crm.deal.list", {
         "filter": {
             "CATEGORY_ID": str(category_id),
@@ -152,15 +145,11 @@ async def get_created_deals(
 # ─── КОММЕНТАРИИ К СДЕЛКАМ ───────────────────────────────────────────────────
 
 async def fetch_comments_for_deals(
-    session:   aiohttp.ClientSession,
-    deal_ids:  List[str],
+    session: aiohttp.ClientSession,
+    deal_ids: List[str],
     date_from: datetime,
-    date_to:   datetime,
+    date_to: datetime,
 ) -> Dict[str, List[str]]:
-    """
-    Получить все комментарии к сделкам за период.
-    Возвращает {deal_id: [текст комментария, ...]}
-    """
     if not deal_ids:
         return {}
 
@@ -190,13 +179,12 @@ async def fetch_comments_for_deals(
                 if not isinstance(item, dict):
                     continue
                 created_raw = str(item.get("CREATED", "") or "")
-                # Фильтруем по дате
                 try:
                     dt = datetime.fromisoformat(created_raw[:19])
                     if dt < date_from or dt > date_to:
                         continue
                 except (ValueError, TypeError):
-                    pass  # если дата не парсится — включаем всё
+                    pass
                 text = str(item.get("COMMENT", "") or "")
                 if text:
                     texts.append(text.lower())
@@ -225,37 +213,32 @@ def has_agreed(texts: List[str]) -> bool:
 async def generate_report(date_from: datetime, date_to: datetime, period_label: str) -> str:
     async with aiohttp.ClientSession() as session:
 
-        # ── 1. Сделки Продажи, изменённые за период ─────────────────────────
         sales_deals = await get_modified_deals(session, date_from, date_to, PIPELINE_SALES_ID)
         logger.info(f"Sales deals: {len(sales_deals)}")
 
-        # ── 2. Сделки Развитие, изменённые за период ────────────────────────
         dev_deals = await get_modified_deals(session, date_from, date_to, PIPELINE_DEV_ID)
         logger.info(f"Dev deals: {len(dev_deals)}")
 
-        # ── 3. Сделки Развитие, СОЗДАННЫЕ за период (переведены из Продажи) ─
         dev_created = await get_created_deals(session, date_from, date_to, PIPELINE_DEV_ID)
         logger.info(f"Dev deals created today: {len(dev_created)}")
 
-        # ── 4. Инициализация счётчиков ────────────────────────────────────────
         stats: Dict[int, dict] = {
             eid: {
                 "total_sales":    0,
-                "deletion":       {},    # reason → count
+                "deletion":       {},
                 "deletion_total": 0,
                 "agreed":         0,
                 "moved_to_dev":   0,
                 "начало":         0,
                 "сбор_инфо":      0,
                 "тех_валидация":  0,
-                "доработки":      0,     # сейчас в доработках
+                "доработки":      0,
                 "финал":          0,
                 "тест_заказ":     0,
             }
             for eid in EMPLOYEES
         }
 
-        # ── 5. Разбор Продажи по текущему этапу ─────────────────────────────
         sales_del_ids: List[str]      = []
         sales_all_ids: List[str]      = []
         sales_deal_emp: Dict[str,int] = {}
@@ -273,7 +256,6 @@ async def generate_report(date_from: datetime, date_to: datetime, period_label: 
                 sales_del_ids.append(did)
                 stats[emp_id]["deletion_total"] += 1
 
-        # ── 6. Комментарии к удалённым сделкам (причины) ─────────────────────
         if sales_del_ids:
             del_comments = await fetch_comments_for_deals(session, sales_del_ids, date_from, date_to)
             for did in sales_del_ids:
@@ -285,7 +267,6 @@ async def generate_report(date_from: datetime, date_to: datetime, period_label: 
                 rc     = stats[emp_id]["deletion"]
                 rc[reason] = rc.get(reason, 0) + 1
 
-        # ── 7. "Договорились" — ищем по комментариям Продажи ─────────────────
         if sales_all_ids:
             all_comments = await fetch_comments_for_deals(session, sales_all_ids, date_from, date_to)
             for did, texts in all_comments.items():
@@ -295,13 +276,11 @@ async def generate_report(date_from: datetime, date_to: datetime, period_label: 
                 if has_agreed(texts):
                     stats[emp_id]["agreed"] += 1
 
-        # ── 8. Переводы из Продажи → Развитие ────────────────────────────────
         for d in dev_created:
             emp_id = int(d.get("ASSIGNED_BY_ID", 0))
             if emp_id in EMPLOYEES:
                 stats[emp_id]["moved_to_dev"] += 1
 
-        # ── 9. Разбор Развитие по текущему этапу ─────────────────────────────
         for d in dev_deals:
             emp_id = int(d.get("ASSIGNED_BY_ID", 0))
             if emp_id not in EMPLOYEES:
@@ -314,7 +293,6 @@ async def generate_report(date_from: datetime, date_to: datetime, period_label: 
             elif stage == STAGE_DEV_FINAL:      stats[emp_id]["финал"]         += 1
             elif stage == STAGE_DEV_TEST_ORDER: stats[emp_id]["тест_заказ"]    += 1
 
-    # ── ФОРМАТИРОВАНИЕ ────────────────────────────────────────────────────────
     def e(t: str) -> str:
         for ch in r"\_*[]()~`>#+-=|{}.!":
             t = t.replace(ch, f"\\{ch}")
@@ -383,7 +361,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await update.message.reply_text("⏳ Формирую дневной отчёт…")
-    now       = datetime.now()
+    now       = datetime.now(TZ).replace(tzinfo=None)
     date_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         report = await generate_report(date_from, now, f"сегодня {now.strftime('%d.%m.%Y')}")
@@ -397,7 +375,7 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await update.message.reply_text("⏳ Формирую недельный отчёт…")
-    now    = datetime.now()
+    now    = datetime.now(TZ).replace(tzinfo=None)
     monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     label  = f"неделя {monday.strftime('%d.%m')}–{now.strftime('%d.%m.%Y')}"
     try:
@@ -409,13 +387,12 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Диагностика"""
     if not is_allowed(update):
         return
     await update.message.reply_text("🔍 Диагностика…")
-    now       = datetime.now()
+    now       = datetime.now(TZ).replace(tzinfo=None)
     date_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    lines     = [f"🕐 {now.strftime('%Y-%m-%d %H:%M:%S')}\n"]
+    lines     = [f"🕐 {now.strftime('%Y-%m-%d %H:%M:%S')} (Ташкент UTC+5)\n"]
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -445,7 +422,6 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dev_created = await get_created_deals(session, date_from, now, PIPELINE_DEV_ID)
             lines.append(f"\n🆕 Развитие создано сегодня: {len(dev_created)}")
 
-            # Проверяем комментарии на одной сделке
             if sales_deals:
                 test_id = sales_deals[0]["ID"]
                 comments = await fetch_comments_for_deals(session, [test_id], date_from, now)
