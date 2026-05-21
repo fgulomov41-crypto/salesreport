@@ -8,12 +8,13 @@ Bitrix24 Sales Report Telegram Bot
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
+import pytz
 import aiohttp
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
 
 # ─── КОНФИГУРАЦИЯ ───────────────────────────────────────────────────────────
 
@@ -22,7 +23,11 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8319953238:AAHsGW0vZYYAgQpPdk3
 _chat_ids_env    = os.getenv("ALLOWED_CHAT_IDS",  "-1002830183416")
 ALLOWED_CHAT_IDS : List[int] = [int(x.strip()) for x in _chat_ids_env.split(",") if x.strip()]
 
-TZ = ZoneInfo("Asia/Tashkent")
+TZ      = ZoneInfo("Asia/Tashkent")
+TZ_PYTZ = pytz.timezone("Asia/Tashkent")
+
+AUTO_REPORT_HOUR   = 19
+AUTO_REPORT_MINUTE = 0
 
 EMPLOYEES: Dict[int, str] = {
     389012: "Akmaljon Xolmatov",
@@ -214,13 +219,8 @@ async def generate_report(date_from: datetime, date_to: datetime, period_label: 
     async with aiohttp.ClientSession() as session:
 
         sales_deals = await get_modified_deals(session, date_from, date_to, PIPELINE_SALES_ID)
-        logger.info(f"Sales deals: {len(sales_deals)}")
-
-        dev_deals = await get_modified_deals(session, date_from, date_to, PIPELINE_DEV_ID)
-        logger.info(f"Dev deals: {len(dev_deals)}")
-
+        dev_deals   = await get_modified_deals(session, date_from, date_to, PIPELINE_DEV_ID)
         dev_created = await get_created_deals(session, date_from, date_to, PIPELINE_DEV_ID)
-        logger.info(f"Dev deals created today: {len(dev_created)}")
 
         stats: Dict[int, dict] = {
             eid: {
@@ -396,7 +396,6 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with aiohttp.ClientSession() as session:
-
             sales_deals = await get_modified_deals(session, date_from, now, PIPELINE_SALES_ID)
             lines.append(f"📦 Продажи изменено сегодня: {len(sales_deals)}")
             by_stage: Dict[str,int] = {}
@@ -436,16 +435,44 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ─── АВТОМАТИЧЕСКАЯ ОТПРАВКА ─────────────────────────────────────────────────
+
+async def scheduled_daily_report(context: CallbackContext) -> None:
+    """Автоматически отправляет дневной отчёт пн–пт в 19:00 по Ташкенту"""
+    now = datetime.now(TZ).replace(tzinfo=None)
+
+    if now.weekday() >= 5:
+        logger.info(f"Skipping report — weekend ({now.strftime('%A %d.%m.%Y')})")
+        return
+
+    date_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    logger.info(f"Sending scheduled daily report for {now.strftime('%d.%m.%Y')}")
+    try:
+        report = await generate_report(date_from, now, f"сегодня {now.strftime('%d.%m.%Y')}")
+        for chat_id in ALLOWED_CHAT_IDS:
+            await context.bot.send_message(chat_id=chat_id, text=report, parse_mode="MarkdownV2")
+    except Exception as e:
+        logger.exception("Error in scheduled report")
+        for chat_id in ALLOWED_CHAT_IDS:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка авто-отчёта: {e}")
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     logger.info("Starting Sales Report Bot…")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("daily",  cmd_daily))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
     app.add_handler(CommandHandler("debug",  cmd_debug))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+
+    send_time = dt_time(hour=AUTO_REPORT_HOUR, minute=AUTO_REPORT_MINUTE, tzinfo=TZ_PYTZ)
+    app.job_queue.run_daily(scheduled_daily_report, time=send_time)
+    logger.info(f"Scheduled daily report at {AUTO_REPORT_HOUR:02d}:{AUTO_REPORT_MINUTE:02d} Tashkent time")
+
     logger.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
